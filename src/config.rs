@@ -9,6 +9,7 @@ pub struct Config {
     pub strategy: String,
     pub retry: RetryConfig,
     pub required_model: String,
+    // pub max_body_size: usize,
 }
 
 #[derive(Debug, Deserialize, Clone)]

@@ -1,20 +1,20 @@
 use axum::{
-    body::Body,
+    body::{to_bytes, Body},
     extract::State,
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
-use http::{HeaderMap, HeaderName, HeaderValue};
-use http_body_util::BodyExt as _;
-use hyper::{Request, StatusCode};
+use futures_util::StreamExt;
+use http::{HeaderName, HeaderValue, Request, StatusCode};
+use hyper::Method;
 use ollama_manager::{
     health::{HealthChecker, HttpHealthCheck},
     lb::{LeastConnections, RandomStrategy, RoundRobin},
     Config, Endpoint, LoadBalancer, LoadBalancerError, LoadBalancingStrategy,
 };
 use serde::Serialize;
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 use tokio::net::TcpListener;
 use tracing::{error, info, warn, Level};
 use tracing_subscriber::fmt;
@@ -128,89 +128,81 @@ async fn handle_proxy(
         .map_or_else(String::new, |q| format!("?{}", q));
     let forward_url = format!("{}{}{}", endpoint.url, path, query);
 
-    // Log request details
-    info!("Request method: {}", req.method());
-    info!("Request path: {}", path);
-    info!("Request query: {}", query);
-    info!("Forward URL: {}", forward_url);
-    info!("Request headers:");
-    for (name, value) in req.headers() {
-        info!("  {}: {}", name, value.to_str().unwrap_or("<binary>"));
-    }
-
-    // Convert hyper::Method to reqwest::Method
-    let method = match req.method() {
-        &hyper::Method::GET => reqwest::Method::GET,
-        &hyper::Method::POST => reqwest::Method::POST,
-        &hyper::Method::PUT => reqwest::Method::PUT,
-        &hyper::Method::DELETE => reqwest::Method::DELETE,
-        &hyper::Method::HEAD => reqwest::Method::HEAD,
-        &hyper::Method::OPTIONS => reqwest::Method::OPTIONS,
-        &hyper::Method::CONNECT => reqwest::Method::CONNECT,
-        &hyper::Method::PATCH => reqwest::Method::PATCH,
-        &hyper::Method::TRACE => reqwest::Method::TRACE,
-        _ => reqwest::Method::GET,
-    };
+    // Create the client request
+    let client = reqwest::Client::new();
+    let mut client_req = client.request(
+        reqwest::Method::from_bytes(req.method().as_str().as_bytes())?,
+        &forward_url,
+    );
 
     // Convert headers
     let mut reqwest_headers = reqwest::header::HeaderMap::new();
     for (name, value) in req.headers() {
         if name.as_str().to_lowercase() != "host" {
-            if let Ok(name) = reqwest::header::HeaderName::from_bytes(name.as_ref()) {
-                if let Ok(value) = reqwest::header::HeaderValue::from_bytes(value.as_bytes()) {
-                    reqwest_headers.insert(name, value);
-                }
+            if let Ok(value) = reqwest::header::HeaderValue::from_bytes(value.as_bytes()) {
+                reqwest_headers
+                    .insert(reqwest::header::HeaderName::from_str(name.as_str())?, value);
             }
         }
     }
-
-    // Create the client request
-    let client = reqwest::Client::new();
-    let mut client_req = client
-        .request(method, &forward_url)
-        .headers(reqwest_headers);
+    client_req = client_req.headers(reqwest_headers);
 
     // Handle the body for POST/PUT requests
-    if req.method() == hyper::Method::POST || req.method() == hyper::Method::PUT {
-        let body_bytes = req.collect().await?.to_bytes();
-        info!("Request body: {}", String::from_utf8_lossy(&body_bytes));
+    if req.method() == Method::POST || req.method() == Method::PUT {
+        const MAX_BODY_SIZE: usize = 32 * 1024 * 1024; // 32MB
+        let body_bytes = to_bytes(req.into_body(), MAX_BODY_SIZE).await?;
+        let body_bytes = body_bytes.to_vec();
         client_req = client_req.body(body_bytes);
     }
 
     // Send the request
     let response = client_req.send().await?;
-
-    info!("Response status: {}", response.status());
-    info!("Response headers:");
-    for (name, value) in response.headers() {
-        info!("  {}: {}", name, value.to_str().unwrap_or("<binary>"));
-    }
-
-    // Convert status code
     let status = StatusCode::from_u16(response.status().as_u16())
-        .map_err(|e| anyhow::anyhow!("Invalid status code: {}", e))?;
+        .map_err(|_| anyhow::anyhow!("Invalid status code"))?;
+    let headers = response.headers().clone();
 
-    // Convert response headers
-    let mut response_headers = HeaderMap::new();
-    for (name, value) in response.headers() {
-        if let Ok(name) = HeaderName::from_bytes(name.as_ref()) {
-            if let Ok(value) = HeaderValue::from_bytes(value.as_bytes()) {
-                response_headers.insert(name, value);
+    // Check if the response is a streaming response (application/x-ndjson)
+    let content_type = headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok());
+
+    if content_type.map_or(false, |ct| ct.contains("application/x-ndjson")) {
+        // Create a streaming response
+        let stream = response.bytes_stream().map(|result| match result {
+            Ok(bytes) => Ok::<_, std::io::Error>(bytes),
+            Err(err) => Err(std::io::Error::new(std::io::ErrorKind::Other, err)),
+        });
+
+        // Convert the stream into a response
+        let body = axum::body::Body::from_stream(stream);
+
+        // Build and return the streaming response
+        let mut builder = Response::builder().status(status);
+        for (name, value) in headers {
+            if let Some(name) = name {
+                if let Ok(header_name) = HeaderName::from_str(name.as_str()) {
+                    if let Ok(header_value) = HeaderValue::from_bytes(value.as_bytes()) {
+                        builder = builder.header(header_name, header_value);
+                    }
+                }
             }
         }
+        Ok(builder.body(body)?)
+    } else {
+        // Handle non-streaming response
+        let body_bytes = response.bytes().await?;
+        let mut builder = Response::builder().status(status);
+        for (name, value) in headers {
+            if let Some(name) = name {
+                if let Ok(header_name) = HeaderName::from_str(name.as_str()) {
+                    if let Ok(header_value) = HeaderValue::from_bytes(value.as_bytes()) {
+                        builder = builder.header(header_name, header_value);
+                    }
+                }
+            }
+        }
+        Ok(builder.body(Body::from(body_bytes))?)
     }
-
-    let body_bytes = response.bytes().await?;
-    info!("Response body: {}", String::from_utf8_lossy(&body_bytes));
-
-    // Build the response
-    let mut builder = Response::builder().status(status);
-    *builder.headers_mut().unwrap() = response_headers;
-
-    // Create the final response
-    Ok(builder
-        .body(Body::from(body_bytes))
-        .map_err(|e| anyhow::anyhow!("Failed to build response: {}", e))?)
 }
 
 async fn handle_health_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
