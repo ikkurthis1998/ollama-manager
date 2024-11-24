@@ -16,7 +16,7 @@ use ollama_manager::{
 use serde::Serialize;
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::net::TcpListener;
-use tracing::{error, info, Level};
+use tracing::{error, info, warn, Level};
 use tracing_subscriber::fmt;
 mod model_manager;
 use model_manager::ModelManager;
@@ -34,6 +34,7 @@ struct EndpointHealth {
     url: String,
     healthy: bool,
     current_connections: u32,
+    model_available: bool,
 }
 
 // Custom error handling
@@ -95,6 +96,19 @@ fn create_strategy(strategy_name: &str) -> Box<dyn LoadBalancingStrategy + Send 
 
 struct AppState {
     load_balancer: Arc<LoadBalancer>,
+    required_model: String,
+}
+
+async fn verify_model_availability(endpoint: &Endpoint, model_name: &str) -> Result<(), AppError> {
+    let model_manager = ModelManager::new();
+    if !model_manager.is_model_present(endpoint, model_name).await? {
+        return Err(LoadBalancerError::ConfigError(format!(
+            "Required model {} is not available on endpoint {}",
+            model_name, endpoint.url
+        ))
+        .into());
+    }
+    Ok(())
 }
 
 async fn handle_proxy(
@@ -102,6 +116,9 @@ async fn handle_proxy(
     req: Request<Body>,
 ) -> Result<Response, AppError> {
     let endpoint = state.load_balancer.get_endpoint().await?;
+
+    // Verify model availability before processing the request
+    verify_model_availability(endpoint, &state.required_model).await?;
 
     // Build the forwarding URL
     let path = req.uri().path();
@@ -198,35 +215,79 @@ async fn handle_proxy(
 
 async fn handle_health_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let endpoints = &state.load_balancer.endpoints;
+    let model_manager = ModelManager::new();
 
-    let endpoint_health: Vec<EndpointHealth> = endpoints
-        .iter()
-        .map(|endpoint| EndpointHealth {
+    let mut endpoint_health = Vec::new();
+
+    for endpoint in endpoints.iter() {
+        let model_status = model_manager
+            .is_model_present(endpoint, &state.required_model)
+            .await
+            .unwrap_or(false);
+
+        endpoint_health.push(EndpointHealth {
             url: endpoint.url.clone(),
             healthy: endpoint.is_healthy(),
             current_connections: endpoint.get_connections(),
-        })
-        .collect();
+            model_available: model_status,
+        });
+    }
 
-    let healthy_count = endpoint_health.iter().filter(|ep| ep.healthy).count();
+    let healthy_count = endpoint_health
+        .iter()
+        .filter(|ep| ep.healthy && ep.model_available)
+        .count();
 
     let response = HealthResponse {
-        status: "OK".to_string(),
+        status: if healthy_count > 0 { "OK" } else { "UNHEALTHY" }.to_string(),
         healthy_endpoints: endpoint_health,
         total_endpoints: endpoints.len(),
         healthy_count,
     };
 
-    (StatusCode::OK, Json(response))
+    (
+        if healthy_count > 0 {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        Json(response),
+    )
 }
 
 async fn initialize_system(config: &Config, endpoints: &[Endpoint]) -> Result<(), AppError> {
     let model_manager = ModelManager::new();
 
-    // Ensure the required model is present on all endpoints
-    model_manager
-        .ensure_model_on_all_endpoints(endpoints, &config.required_model)
-        .await?;
+    for endpoint in endpoints {
+        match model_manager
+            .ensure_model(endpoint, &config.required_model)
+            .await
+        {
+            Ok(_) => {
+                info!(
+                    "Successfully verified/installed model {} on {}",
+                    config.required_model, endpoint.url
+                );
+                endpoint.mark_healthy(); // Mark endpoint as healthy after successful model installation
+            }
+            Err(e) => {
+                let error_msg = format!(
+                    "Failed to verify/install model {} on {}: {}",
+                    config.required_model, endpoint.url, e
+                );
+                warn!("{}", error_msg);
+                endpoint.mark_unhealthy(); // Mark endpoint as unhealthy if model installation fails
+            }
+        }
+    }
+
+    // Check if at least one endpoint is healthy
+    if !endpoints.iter().any(|e| e.is_healthy()) {
+        return Err(LoadBalancerError::ConfigError(
+            "No healthy endpoints after initialization".to_string(),
+        )
+        .into());
+    }
 
     Ok(())
 }
@@ -238,9 +299,10 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Config::from_file("config/config.yaml")?;
 
-    let health_check = Box::new(HttpHealthCheck::new(Duration::from_secs(
-        config.health_check.timeout_seconds,
-    )));
+    let health_check = Box::new(HttpHealthCheck::new(
+        Duration::from_secs(config.health_check.timeout_seconds),
+        config.required_model.clone(),
+    ));
     let health_checker = HealthChecker::new(health_check, config.health_check.clone());
     let strategy = create_strategy(&config.strategy);
     let load_balancer = Arc::new(LoadBalancer::new(config.clone(), strategy, health_checker));
@@ -252,6 +314,7 @@ async fn main() -> anyhow::Result<()> {
 
     let app_state = Arc::new(AppState {
         load_balancer: load_balancer.clone(),
+        required_model: config.required_model.clone(),
     });
 
     let app = Router::new()
