@@ -8,6 +8,8 @@ pub struct Config {
     pub health_check: HealthCheckConfig,
     pub strategy: String,
     pub retry: RetryConfig,
+    pub required_model: String,
+    // pub max_body_size: usize,
 }
 
 #[derive(Debug, Deserialize, Clone)]

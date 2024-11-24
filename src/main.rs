@@ -1,23 +1,26 @@
+use axum::body::{to_bytes, Body};
 use axum::{
-    body::Body,
     extract::State,
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
-use http::{HeaderMap, HeaderName, HeaderValue};
-use http_body_util::BodyExt as _;
-use hyper::{Request, StatusCode};
+use futures_util::StreamExt;
+use http::{HeaderName, HeaderValue, Request, StatusCode};
+use http_body_util::StreamBody;
+use hyper::Method;
 use ollama_manager::{
     health::{HealthChecker, HttpHealthCheck},
     lb::{LeastConnections, RandomStrategy, RoundRobin},
-    Config, LoadBalancer, LoadBalancerError, LoadBalancingStrategy,
+    Config, Endpoint, LoadBalancer, LoadBalancerError, LoadBalancingStrategy,
 };
 use serde::Serialize;
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 use tokio::net::TcpListener;
-use tracing::{error, info, Level};
+use tracing::{error, info, warn, Level};
 use tracing_subscriber::fmt;
+mod model_manager;
+use model_manager::ModelManager;
 
 #[derive(Serialize)]
 struct HealthResponse {
@@ -32,9 +35,11 @@ struct EndpointHealth {
     url: String,
     healthy: bool,
     current_connections: u32,
+    model_available: bool,
 }
 
 // Custom error handling
+#[derive(Debug)]
 struct AppError(anyhow::Error);
 
 impl IntoResponse for AppError {
@@ -92,6 +97,19 @@ fn create_strategy(strategy_name: &str) -> Box<dyn LoadBalancingStrategy + Send 
 
 struct AppState {
     load_balancer: Arc<LoadBalancer>,
+    required_model: String,
+}
+
+async fn verify_model_availability(endpoint: &Endpoint, model_name: &str) -> Result<(), AppError> {
+    let model_manager = ModelManager::new();
+    if !model_manager.is_model_present(endpoint, model_name).await? {
+        return Err(LoadBalancerError::ConfigError(format!(
+            "Required model {} is not available on endpoint {}",
+            model_name, endpoint.url
+        ))
+        .into());
+    }
+    Ok(())
 }
 
 async fn handle_proxy(
@@ -99,6 +117,9 @@ async fn handle_proxy(
     req: Request<Body>,
 ) -> Result<Response, AppError> {
     let endpoint = state.load_balancer.get_endpoint().await?;
+
+    // Verify model availability before processing the request
+    verify_model_availability(endpoint, &state.required_model).await?;
 
     // Build the forwarding URL
     let path = req.uri().path();
@@ -108,113 +129,161 @@ async fn handle_proxy(
         .map_or_else(String::new, |q| format!("?{}", q));
     let forward_url = format!("{}{}{}", endpoint.url, path, query);
 
-    // Log request details
-    info!("Request method: {}", req.method());
-    info!("Request path: {}", path);
-    info!("Request query: {}", query);
-    info!("Forward URL: {}", forward_url);
-    info!("Request headers:");
-    for (name, value) in req.headers() {
-        info!("  {}: {}", name, value.to_str().unwrap_or("<binary>"));
-    }
-
-    // Convert hyper::Method to reqwest::Method
-    let method = match req.method() {
-        &hyper::Method::GET => reqwest::Method::GET,
-        &hyper::Method::POST => reqwest::Method::POST,
-        &hyper::Method::PUT => reqwest::Method::PUT,
-        &hyper::Method::DELETE => reqwest::Method::DELETE,
-        &hyper::Method::HEAD => reqwest::Method::HEAD,
-        &hyper::Method::OPTIONS => reqwest::Method::OPTIONS,
-        &hyper::Method::CONNECT => reqwest::Method::CONNECT,
-        &hyper::Method::PATCH => reqwest::Method::PATCH,
-        &hyper::Method::TRACE => reqwest::Method::TRACE,
-        _ => reqwest::Method::GET,
-    };
+    // Create the client request
+    let client = reqwest::Client::new();
+    let mut client_req = client.request(
+        reqwest::Method::from_bytes(req.method().as_str().as_bytes())?,
+        &forward_url,
+    );
 
     // Convert headers
     let mut reqwest_headers = reqwest::header::HeaderMap::new();
     for (name, value) in req.headers() {
         if name.as_str().to_lowercase() != "host" {
-            if let Ok(name) = reqwest::header::HeaderName::from_bytes(name.as_ref()) {
-                if let Ok(value) = reqwest::header::HeaderValue::from_bytes(value.as_bytes()) {
-                    reqwest_headers.insert(name, value);
-                }
+            if let Ok(value) = reqwest::header::HeaderValue::from_bytes(value.as_bytes()) {
+                reqwest_headers
+                    .insert(reqwest::header::HeaderName::from_str(name.as_str())?, value);
             }
         }
     }
-
-    // Create the client request
-    let client = reqwest::Client::new();
-    let mut client_req = client
-        .request(method, &forward_url)
-        .headers(reqwest_headers);
+    client_req = client_req.headers(reqwest_headers);
 
     // Handle the body for POST/PUT requests
-    if req.method() == hyper::Method::POST || req.method() == hyper::Method::PUT {
-        let body_bytes = req.collect().await?.to_bytes();
-        info!("Request body: {}", String::from_utf8_lossy(&body_bytes));
+    if req.method() == Method::POST || req.method() == Method::PUT {
+        let body_bytes = to_bytes(req.into_body(), 32 * 1024 * 1024).await?;
         client_req = client_req.body(body_bytes);
     }
 
     // Send the request
     let response = client_req.send().await?;
+    let status = response.status();
+    let headers = response.headers().clone();
 
-    info!("Response status: {}", response.status());
-    info!("Response headers:");
-    for (name, value) in response.headers() {
-        info!("  {}: {}", name, value.to_str().unwrap_or("<binary>"));
-    }
+    // Get content type
+    let is_stream = headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map_or(false, |ct| ct.contains("application/x-ndjson"));
 
-    // Convert status code
-    let status = StatusCode::from_u16(response.status().as_u16())
-        .map_err(|e| anyhow::anyhow!("Invalid status code: {}", e))?;
-
-    // Convert response headers
-    let mut response_headers = HeaderMap::new();
-    for (name, value) in response.headers() {
-        if let Ok(name) = HeaderName::from_bytes(name.as_ref()) {
-            if let Ok(value) = HeaderValue::from_bytes(value.as_bytes()) {
-                response_headers.insert(name, value);
+    if is_stream {
+        // Create response headers
+        let mut response_headers = http::HeaderMap::new();
+        for (name, value) in headers.iter() {
+            if let Ok(name) = http::header::HeaderName::from_str(name.as_str()) {
+                if let Ok(header_value) = http::header::HeaderValue::from_bytes(value.as_bytes()) {
+                    response_headers.insert(name, header_value);
+                }
             }
         }
+
+        // Create a streaming body
+        let stream = response.bytes_stream().map(|result| match result {
+            Ok(bytes) => Ok::<_, std::io::Error>(bytes),
+            Err(err) => Err(std::io::Error::new(std::io::ErrorKind::Other, err)),
+        });
+
+        // Use StreamBody from http_body_util and wrap it with Axum's Body
+        let body = Body::from_stream(StreamBody::new(stream));
+
+        // Return streaming response
+        Ok(Response::builder()
+            .status(StatusCode::from_u16(status.as_u16())?)
+            .header(http::header::CONTENT_TYPE, "application/x-ndjson")
+            .body(body)?) // Ensure body is compatible with axum::body::Body
+    } else {
+        // Handle non-streaming response
+        let body_bytes = response.bytes().await?;
+        let mut builder = Response::builder().status(StatusCode::from_u16(status.as_u16())?);
+        for (name, value) in headers {
+            if let Some(name) = name {
+                if let Ok(header_name) = HeaderName::from_str(name.as_str()) {
+                    if let Ok(header_value) = HeaderValue::from_bytes(value.as_bytes()) {
+                        builder = builder.header(header_name, header_value);
+                    }
+                }
+            }
+        }
+        Ok(builder.body(Body::from(body_bytes))?) // Ensure body is of type axum::body::Body
     }
-
-    let body_bytes = response.bytes().await?;
-    info!("Response body: {}", String::from_utf8_lossy(&body_bytes));
-
-    // Build the response
-    let mut builder = Response::builder().status(status);
-    *builder.headers_mut().unwrap() = response_headers;
-
-    // Create the final response
-    Ok(builder
-        .body(Body::from(body_bytes))
-        .map_err(|e| anyhow::anyhow!("Failed to build response: {}", e))?)
 }
 
 async fn handle_health_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let endpoints = &state.load_balancer.endpoints;
+    let model_manager = ModelManager::new();
 
-    let endpoint_health: Vec<EndpointHealth> = endpoints
-        .iter()
-        .map(|endpoint| EndpointHealth {
+    let mut endpoint_health = Vec::new();
+
+    for endpoint in endpoints.iter() {
+        let model_status = model_manager
+            .is_model_present(endpoint, &state.required_model)
+            .await
+            .unwrap_or(false);
+
+        endpoint_health.push(EndpointHealth {
             url: endpoint.url.clone(),
             healthy: endpoint.is_healthy(),
             current_connections: endpoint.get_connections(),
-        })
-        .collect();
+            model_available: model_status,
+        });
+    }
 
-    let healthy_count = endpoint_health.iter().filter(|ep| ep.healthy).count();
+    let healthy_count = endpoint_health
+        .iter()
+        .filter(|ep| ep.healthy && ep.model_available)
+        .count();
 
     let response = HealthResponse {
-        status: "OK".to_string(),
+        status: if healthy_count > 0 { "OK" } else { "UNHEALTHY" }.to_string(),
         healthy_endpoints: endpoint_health,
         total_endpoints: endpoints.len(),
         healthy_count,
     };
 
-    (StatusCode::OK, Json(response))
+    (
+        if healthy_count > 0 {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        Json(response),
+    )
+}
+
+async fn initialize_system(config: &Config, endpoints: &[Endpoint]) -> Result<(), AppError> {
+    let model_manager = ModelManager::new();
+
+    for endpoint in endpoints {
+        match model_manager
+            .ensure_model(endpoint, &config.required_model)
+            .await
+        {
+            Ok(_) => {
+                info!(
+                    "Successfully verified/installed model {} on {}",
+                    config.required_model, endpoint.url
+                );
+                endpoint.mark_healthy(); // Mark endpoint as healthy after successful model installation
+            }
+            Err(e) => {
+                let error_msg = format!(
+                    "Failed to verify/install model {} on {}: {}",
+                    config.required_model, endpoint.url, e
+                );
+                warn!("{}", error_msg);
+                endpoint.mark_unhealthy(); // Mark endpoint as unhealthy if model installation fails
+            }
+        }
+    }
+
+    // Check if at least one endpoint is healthy
+    if !endpoints.iter().any(|e| e.is_healthy()) {
+        return Err(LoadBalancerError::ConfigError(
+            "No healthy endpoints after initialization".to_string(),
+        )
+        .into());
+    }
+
+    Ok(())
 }
 
 #[tokio::main]
@@ -224,15 +293,22 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Config::from_file("config/config.yaml")?;
 
-    let health_check = Box::new(HttpHealthCheck::new(Duration::from_secs(
-        config.health_check.timeout_seconds,
-    )));
+    let health_check = Box::new(HttpHealthCheck::new(
+        Duration::from_secs(config.health_check.timeout_seconds),
+        config.required_model.clone(),
+    ));
     let health_checker = HealthChecker::new(health_check, config.health_check.clone());
     let strategy = create_strategy(&config.strategy);
-    let load_balancer = Arc::new(LoadBalancer::new(config, strategy, health_checker));
+    let load_balancer = Arc::new(LoadBalancer::new(config.clone(), strategy, health_checker));
+
+    // Initialize the system and ensure models are present
+    initialize_system(&config, &load_balancer.endpoints)
+        .await
+        .expect("Failed to initialize system");
 
     let app_state = Arc::new(AppState {
         load_balancer: load_balancer.clone(),
+        required_model: config.required_model.clone(),
     });
 
     let app = Router::new()
