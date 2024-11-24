@@ -11,13 +11,15 @@ use hyper::{Request, StatusCode};
 use ollama_manager::{
     health::{HealthChecker, HttpHealthCheck},
     lb::{LeastConnections, RandomStrategy, RoundRobin},
-    Config, LoadBalancer, LoadBalancerError, LoadBalancingStrategy,
+    Config, Endpoint, LoadBalancer, LoadBalancerError, LoadBalancingStrategy,
 };
 use serde::Serialize;
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::net::TcpListener;
 use tracing::{error, info, Level};
 use tracing_subscriber::fmt;
+mod model_manager;
+use model_manager::ModelManager;
 
 #[derive(Serialize)]
 struct HealthResponse {
@@ -35,6 +37,7 @@ struct EndpointHealth {
 }
 
 // Custom error handling
+#[derive(Debug)]
 struct AppError(anyhow::Error);
 
 impl IntoResponse for AppError {
@@ -217,6 +220,17 @@ async fn handle_health_check(State(state): State<Arc<AppState>>) -> impl IntoRes
     (StatusCode::OK, Json(response))
 }
 
+async fn initialize_system(config: &Config, endpoints: &[Endpoint]) -> Result<(), AppError> {
+    let model_manager = ModelManager::new();
+
+    // Ensure the required model is present on all endpoints
+    model_manager
+        .ensure_model_on_all_endpoints(endpoints, &config.required_model)
+        .await?;
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     setup_logging();
@@ -229,7 +243,12 @@ async fn main() -> anyhow::Result<()> {
     )));
     let health_checker = HealthChecker::new(health_check, config.health_check.clone());
     let strategy = create_strategy(&config.strategy);
-    let load_balancer = Arc::new(LoadBalancer::new(config, strategy, health_checker));
+    let load_balancer = Arc::new(LoadBalancer::new(config.clone(), strategy, health_checker));
+
+    // Initialize the system and ensure models are present
+    initialize_system(&config, &load_balancer.endpoints)
+        .await
+        .expect("Failed to initialize system");
 
     let app_state = Arc::new(AppState {
         load_balancer: load_balancer.clone(),

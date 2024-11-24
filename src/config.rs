@@ -8,6 +8,7 @@ pub struct Config {
     pub health_check: HealthCheckConfig,
     pub strategy: String,
     pub retry: RetryConfig,
+    pub required_model: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]

@@ -21,3 +21,5 @@ retry:
   max_attempts: 3
   initial_interval_ms: 100
   max_interval_ms: 1000
+
+required_model: "llama3.2"

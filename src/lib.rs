@@ -4,6 +4,7 @@ pub mod error;
 pub mod health;
 pub mod lb;
 pub mod metrics;
+pub mod model_manager;
 pub mod strategy;
 
 pub use config::Config;
