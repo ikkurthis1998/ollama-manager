@@ -1,5 +1,5 @@
+use axum::body::{to_bytes, Body};
 use axum::{
-    body::{to_bytes, Body},
     extract::State,
     response::{IntoResponse, Response},
     routing::get,
@@ -7,6 +7,7 @@ use axum::{
 };
 use futures_util::StreamExt;
 use http::{HeaderName, HeaderValue, Request, StatusCode};
+use http_body_util::StreamBody;
 use hyper::Method;
 use ollama_manager::{
     health::{HealthChecker, HttpHealthCheck},
@@ -149,49 +150,50 @@ async fn handle_proxy(
 
     // Handle the body for POST/PUT requests
     if req.method() == Method::POST || req.method() == Method::PUT {
-        const MAX_BODY_SIZE: usize = 32 * 1024 * 1024; // 32MB
-        let body_bytes = to_bytes(req.into_body(), MAX_BODY_SIZE).await?;
-        let body_bytes = body_bytes.to_vec();
+        let body_bytes = to_bytes(req.into_body(), 32 * 1024 * 1024).await?;
         client_req = client_req.body(body_bytes);
     }
 
     // Send the request
     let response = client_req.send().await?;
-    let status = StatusCode::from_u16(response.status().as_u16())
-        .map_err(|_| anyhow::anyhow!("Invalid status code"))?;
+    let status = response.status();
     let headers = response.headers().clone();
 
-    // Check if the response is a streaming response (application/x-ndjson)
-    let content_type = headers
+    // Get content type
+    let is_stream = headers
         .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok());
+        .and_then(|v| v.to_str().ok())
+        .map_or(false, |ct| ct.contains("application/x-ndjson"));
 
-    if content_type.map_or(false, |ct| ct.contains("application/x-ndjson")) {
-        // Create a streaming response
+    if is_stream {
+        // Create response headers
+        let mut response_headers = http::HeaderMap::new();
+        for (name, value) in headers.iter() {
+            if let Ok(name) = http::header::HeaderName::from_str(name.as_str()) {
+                if let Ok(header_value) = http::header::HeaderValue::from_bytes(value.as_bytes()) {
+                    response_headers.insert(name, header_value);
+                }
+            }
+        }
+
+        // Create a streaming body
         let stream = response.bytes_stream().map(|result| match result {
             Ok(bytes) => Ok::<_, std::io::Error>(bytes),
             Err(err) => Err(std::io::Error::new(std::io::ErrorKind::Other, err)),
         });
 
-        // Convert the stream into a response
-        let body = axum::body::Body::from_stream(stream);
+        // Use StreamBody from http_body_util and wrap it with Axum's Body
+        let body = Body::from_stream(StreamBody::new(stream));
 
-        // Build and return the streaming response
-        let mut builder = Response::builder().status(status);
-        for (name, value) in headers {
-            if let Some(name) = name {
-                if let Ok(header_name) = HeaderName::from_str(name.as_str()) {
-                    if let Ok(header_value) = HeaderValue::from_bytes(value.as_bytes()) {
-                        builder = builder.header(header_name, header_value);
-                    }
-                }
-            }
-        }
-        Ok(builder.body(body)?)
+        // Return streaming response
+        Ok(Response::builder()
+            .status(StatusCode::from_u16(status.as_u16())?)
+            .header(http::header::CONTENT_TYPE, "application/x-ndjson")
+            .body(body)?) // Ensure body is compatible with axum::body::Body
     } else {
         // Handle non-streaming response
         let body_bytes = response.bytes().await?;
-        let mut builder = Response::builder().status(status);
+        let mut builder = Response::builder().status(StatusCode::from_u16(status.as_u16())?);
         for (name, value) in headers {
             if let Some(name) = name {
                 if let Ok(header_name) = HeaderName::from_str(name.as_str()) {
@@ -201,7 +203,7 @@ async fn handle_proxy(
                 }
             }
         }
-        Ok(builder.body(Body::from(body_bytes))?)
+        Ok(builder.body(Body::from(body_bytes))?) // Ensure body is of type axum::body::Body
     }
 }
 
