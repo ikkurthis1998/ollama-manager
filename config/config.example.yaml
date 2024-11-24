@@ -1,0 +1,23 @@
+endpoints:
+  - url: "http://localhost:8001"
+    weight: 1
+    max_connections: 100
+  - url: "http://localhost:8002"
+    weight: 1
+    max_connections: 100
+  - url: "http://localhost:8003"
+    weight: 1
+    max_connections: 100
+
+health_check:
+  interval_seconds: 5
+  timeout_seconds: 2
+  unhealthy_threshold: 3
+  healthy_threshold: 2
+
+strategy: "round_robin"
+
+retry:
+  max_attempts: 3
+  initial_interval_ms: 100
+  max_interval_ms: 1000
