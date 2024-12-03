@@ -17,7 +17,6 @@ use ollama_manager::{
 use serde::Serialize;
 use std::{net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 use tokio::net::TcpListener;
-use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn, Level};
 use tracing_subscriber::fmt;
 mod model_manager;
@@ -312,24 +311,9 @@ async fn main() -> anyhow::Result<()> {
         required_model: config.required_model.clone(),
     });
 
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods([
-            http::Method::GET,
-            http::Method::POST,
-            http::Method::PUT,
-            http::Method::DELETE,
-            http::Method::OPTIONS,
-            http::Method::HEAD,
-            http::Method::PATCH,
-        ])
-        .allow_headers(Any)
-        .allow_credentials(true);
-
     let app = Router::new()
         .route("/health", get(handle_health_check))
         .fallback(handle_proxy)
-        .layer(cors)
         .with_state(app_state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
