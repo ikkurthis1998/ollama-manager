@@ -9,6 +9,7 @@ use futures_util::StreamExt;
 use http::{HeaderName, HeaderValue, Request, StatusCode};
 use http_body_util::StreamBody;
 use hyper::Method;
+use middleware::ConnectionMiddleware;
 use ollama_manager::{
     health::{HealthChecker, HttpHealthCheck},
     lb::{LeastConnections, RandomStrategy, RoundRobin},
@@ -19,7 +20,9 @@ use std::{net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 use tokio::net::TcpListener;
 use tracing::{error, info, warn, Level};
 use tracing_subscriber::fmt;
+mod middleware;
 mod model_manager;
+
 use model_manager::ModelManager;
 
 #[derive(Serialize)]
@@ -314,6 +317,10 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/health", get(handle_health_check))
         .fallback(handle_proxy)
+        .layer(ConnectionMiddleware {
+            load_balancer: load_balancer.clone(),
+        })
+        .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(app_state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
